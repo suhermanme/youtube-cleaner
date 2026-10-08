@@ -17,3 +17,12 @@ def test_current_action_menu_labels_are_supported():
     pattern = label_pattern("more_actions")
     assert pattern.match("Action menu")
     assert pattern.match("Menu tindakan")
+
+
+def test_remove_saved_playlist_labels_are_exact_and_localized():
+    pattern = label_pattern("remove_playlist_from_library")
+    assert pattern.match("Remove from library")
+    assert pattern.match("Remove playlist from library")
+    assert pattern.match("Hapus dari koleksi")
+    assert not pattern.match("Delete playlist")
+    assert label_pattern("save_playlist_to_library").match("Save to Library")

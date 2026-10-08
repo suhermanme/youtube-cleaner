@@ -55,6 +55,7 @@ class Playlist(BaseModel):
     video_count: int | None = None
     videos: list[LibraryVideo] = Field(default_factory=list)
     owner_name: str | None = None
+    owner_url: str | None = None
     scan_status: ScanStatus = ScanStatus.COMPLETE
     details_scanned: bool = False
 

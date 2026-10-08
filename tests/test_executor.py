@@ -165,3 +165,118 @@ def test_batch_reuses_open_watch_later_page(monkeypatch, tmp_path):
     executor._perform(job, second)
 
     assert navigations == ["https://www.youtube.com/playlist?list=WL"]
+
+
+def test_saved_playlist_removal_opens_each_target_and_uses_library_toggle(monkeypatch, tmp_path):
+    navigations = []
+    removals = []
+
+    class Page:
+        url = "https://www.youtube.com/"
+
+    class Playlist:
+        def __init__(self, page, *, debug_dir=None):
+            pass
+
+        def remove_saved_playlist(self, playlist_id):
+            removals.append(playlist_id)
+            return True
+
+    page = Page()
+
+    def fake_navigate(current_page, url):
+        navigations.append(url)
+        current_page.url = url
+
+    monkeypatch.setattr(executor_module, "navigate", fake_navigate)
+    monkeypatch.setattr(executor_module, "PlaylistPage", Playlist)
+    executor = Executor(page, Settings(action_delay=0), JobStore(tmp_path))
+    job = JobState(
+        job_id="saved-playlists",
+        account_name="Me",
+        account_handle="@me",
+        account_url="https://youtube.com/@me",
+        operation="remove-saved-playlist",
+        targets=[],
+        browser_profile="/tmp/profile",
+    )
+    first = PlanTarget(
+        target_id="saved-playlist:PLone",
+        title="One",
+        url="https://youtube.com/playlist?list=PLone",
+        metadata={"playlist_id": "PLone"},
+    )
+    second = PlanTarget(
+        target_id="saved-playlist:PLtwo",
+        title="Two",
+        url="https://youtube.com/playlist?list=PLtwo",
+        metadata={"playlist_id": "PLtwo"},
+    )
+
+    executor._perform(job, first)
+    executor._perform(job, second)
+
+    assert navigations == [
+        "https://youtube.com/playlist?list=PLone",
+        "https://youtube.com/playlist?list=PLtwo",
+    ]
+    assert removals == ["PLone", "PLtwo"]
+
+
+def test_mixed_playlist_cleanup_routes_saved_and_owned_targets(monkeypatch, tmp_path):
+    navigations = []
+    removals = []
+    deletions = []
+
+    class Page:
+        url = "https://www.youtube.com/"
+
+    class Playlist:
+        def __init__(self, page, *, debug_dir=None):
+            pass
+
+        def remove_saved_playlist(self, playlist_id):
+            removals.append(playlist_id)
+            return True
+
+        def delete_playlist(self, playlist_id):
+            deletions.append(playlist_id)
+            return True
+
+    page = Page()
+
+    def fake_navigate(current_page, url):
+        navigations.append(url)
+        current_page.url = url
+
+    monkeypatch.setattr(executor_module, "navigate", fake_navigate)
+    monkeypatch.setattr(executor_module, "PlaylistPage", Playlist)
+    executor = Executor(page, Settings(action_delay=0), JobStore(tmp_path))
+    job = JobState(
+        job_id="mixed-playlists",
+        account_name="Me",
+        account_handle="@me",
+        account_url="https://youtube.com/@me",
+        operation="clean-playlists",
+        targets=[],
+        browser_profile="/tmp/profile",
+    )
+    saved = PlanTarget(
+        target_id="playlist-clean:PLsaved",
+        title="Saved",
+        url="https://youtube.com/playlist?list=PLsaved",
+        metadata={"playlist_id": "PLsaved", "cleanup_action": "remove-saved"},
+    )
+    owned = PlanTarget(
+        target_id="playlist-clean:PLowned",
+        title="Owned",
+        url="https://youtube.com/playlist?list=PLowned",
+        metadata={"playlist_id": "PLowned", "cleanup_action": "delete-owned"},
+    )
+
+    executor._perform(job, saved)
+    executor._perform(job, owned)
+
+    assert navigations == [saved.url, owned.url]
+    assert removals == ["PLsaved"]
+    assert deletions == ["PLowned"]

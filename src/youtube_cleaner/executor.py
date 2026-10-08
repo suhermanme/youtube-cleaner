@@ -13,7 +13,13 @@ from .config import Settings
 from .jobs import JobStore
 from .models import AccountIdentity, CleanupPlan, JobState, PlanTarget
 from .navigation import LIKED_VIDEOS, WATCH_LATER, navigate
-from .pages import AutomationBlocked, LibraryPage, PlaylistPage, UIChangedError, playlist_id_from_url
+from .pages import (
+    AutomationBlocked,
+    LibraryPage,
+    PlaylistPage,
+    UIChangedError,
+    playlist_id_from_url,
+)
 
 
 class ConfirmationRequired(RuntimeError):
@@ -233,6 +239,34 @@ class Executor:
             self._emit_current("removing", "Removing playlist entry and verifying the UI change")
             if not self._with_retries(lambda: playlist.remove_playlist_occurrence(video_id, occurrence=occurrence)):
                 raise RuntimeError("Playlist removal could not be verified")
+        elif job.operation == "remove-saved-playlist":
+            playlist_id = str(target.metadata["playlist_id"])
+            self._ensure_playlist_open(target.url, "saved playlist")
+            playlist = PlaylistPage(self.page, debug_dir=self.debug_dir)
+            self._emit_current("removing", "Removing saved playlist from the Library and verifying the UI change")
+            if not self._with_retries(lambda: playlist.remove_saved_playlist(playlist_id)):
+                raise RuntimeError("Saved playlist removal could not be verified")
+        elif job.operation == "clean-playlists":
+            playlist_id = str(target.metadata["playlist_id"])
+            cleanup_action = str(target.metadata["cleanup_action"])
+            if cleanup_action == "remove-saved":
+                self._ensure_playlist_open(target.url, "saved playlist")
+                playlist = PlaylistPage(self.page, debug_dir=self.debug_dir)
+                self._emit_current(
+                    "removing",
+                    "Removing saved playlist from the Library and verifying the UI change",
+                )
+                if not self._with_retries(lambda: playlist.remove_saved_playlist(playlist_id)):
+                    raise RuntimeError("Saved playlist removal could not be verified")
+            elif cleanup_action == "delete-owned":
+                self._emit_current("opening", "Opening owned playlist")
+                navigate(self.page, target.url)
+                playlist = PlaylistPage(self.page, debug_dir=self.debug_dir)
+                self._emit_current("removing", "Permanently deleting owned playlist and verifying navigation")
+                if not self._with_retries(lambda: playlist.delete_playlist(playlist_id)):
+                    raise RuntimeError("Playlist deletion could not be verified")
+            else:
+                raise ValueError(f"Unsupported playlist cleanup action: {cleanup_action}")
         elif job.operation == "delete-playlist":
             playlist_id = str(target.metadata["playlist_id"])
             self._emit_current("opening", "Opening playlist")

@@ -1,7 +1,39 @@
 <!doctype html>
 <html lang="en">
+  <script>
+    document.addEventListener("DOMContentLoaded", () => {
+      const button = document.getElementById("library-toggle");
+      if (localStorage.getItem("fixture-playlist-saved") === "false") {
+        button.setAttribute("aria-label", "Save to Library");
+        button.setAttribute("aria-pressed", "false");
+      }
+    });
+  </script>
   <body>
+    <button
+      id="library-toggle"
+      aria-label="Remove from Library"
+      aria-pressed="true"
+      onclick="localStorage.setItem('fixture-playlist-saved', 'false'); this.setAttribute('aria-label', 'Save to Library'); this.setAttribute('aria-pressed', 'false')"
+    ></button>
     <div id="page-header">Fixture playlist · 3 videos</div>
+    <yt-flexible-actions-view-model>
+      <button
+        aria-label="More actions"
+        onclick="document.getElementById('playlist-menu').hidden = false"
+      ></button>
+    </yt-flexible-actions-view-model>
+    <div id="playlist-menu" role="menu" hidden>
+      <div
+        role="menuitem"
+        onclick="this.parentElement.hidden = true; document.getElementById('delete-dialog').hidden = false"
+      >Delete playlist</div>
+    </div>
+    <div id="delete-dialog" role="dialog" hidden>
+      <button
+        onclick="history.replaceState({}, '', '?deleted=1'); this.closest('[role=dialog]').hidden = true"
+      >Delete</button>
+    </div>
     <ytd-playlist-video-renderer>
       <a id="video-title" href="/watch?v=alpha123&list=PLfixture" title="Alpha video">Alpha video</a>
       <ytd-channel-name><a href="/@alpha">Alpha Channel</a></ytd-channel-name>

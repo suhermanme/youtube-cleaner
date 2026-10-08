@@ -4,6 +4,7 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Annotated
+from urllib.parse import urlparse
 
 import typer
 from rich.prompt import IntPrompt, Prompt
@@ -300,6 +301,12 @@ def scan_command(ctx: typer.Context, area: Annotated[str | None, typer.Argument(
     areas = [_normalize_scan_area(area)] if area else ["likes", "watch-later", "playlists"]
     for selected in areas:
         show_scan(_scan(runtime, selected))
+    console.print("\n[bold cyan]Read-only scan complete. No YouTube data was modified.[/bold cyan]")
+    if areas == ["playlists"]:
+        console.print(
+            "To preview playlist cleanup, run: "
+            "[bold]youtube-cleaner --browser chrome playlists clean --all --dry-run[/bold]"
+        )
 
 
 def _area_scan_command(ctx: typer.Context, area: str, *, list_items: bool = False) -> ScanResult:
@@ -492,6 +499,41 @@ def _choose_playlist(playlists: list[Playlist], playlist_id: str | None) -> Play
     return chosen
 
 
+def _playlist_write_block_reason(playlist: Playlist, account: AccountIdentity) -> str | None:
+    """Explain playlist ownership cases that are definitely not editable.
+
+    The playlist feed contains both playlists created by the active profile and
+    playlists merely saved to its library.  Scanning either kind is valid, but
+    YouTube only exposes per-item removal controls for the former.
+    """
+    if playlist.playlist_id.startswith("OLAK5uy_"):
+        return "it is an auto-generated YouTube Music album playlist"
+
+    owner_path = urlparse(playlist.owner_url or "").path.rstrip("/").casefold()
+    active_paths = {
+        urlparse(account.channel_url or "").path.rstrip("/").casefold(),
+        f"/{(account.channel_handle or '').casefold()}",
+    } - {"", "/"}
+    if owner_path and owner_path not in active_paths:
+        return f"it is owned by {playlist.owner_name or playlist.owner_url!r}, not the active profile"
+
+    owner = " ".join((playlist.owner_name or "").split()).casefold()
+    active_name = " ".join((account.channel_name or "").split()).casefold()
+    if not owner_path and owner and active_name and owner not in {active_name, "you", "anda"}:
+        return f"it is owned by {playlist.owner_name!r}, not the active profile {account.channel_name!r}"
+    return None
+
+
+def _require_writable_playlist(playlist: Playlist, account: AccountIdentity) -> None:
+    reason = _playlist_write_block_reason(playlist, account)
+    if reason:
+        raise typer.BadParameter(
+            f"Playlist {playlist.title!r} cannot be cleaned item by item because {reason}. "
+            "Only playlists created by the active YouTube profile are editable; saved albums, "
+            "mixes, channel playlists, and other creators' playlists are read-only here."
+        )
+
+
 def _scan_selected_playlist(runtime: Runtime, playlist_id: str | None):
     index = _scan(runtime, "playlists")
     selected = _choose_playlist(index.playlists, playlist_id)
@@ -506,6 +548,37 @@ def _scan_selected_playlist(runtime: Runtime, playlist_id: str | None):
         _close(session)
 
 
+def _playlist_cleanup_targets(
+    playlists: list[Playlist], account: AccountIdentity
+) -> list[PlanTarget]:
+    """Build one plan that safely handles both kinds of Library playlist."""
+    targets: list[PlanTarget] = []
+    for playlist in playlists:
+        external = _playlist_write_block_reason(playlist, account) is not None
+        cleanup_action = "remove-saved" if external else "delete-owned"
+        targets.append(
+            PlanTarget(
+                target_id=f"playlist-clean:{playlist.playlist_id}",
+                title=playlist.title,
+                url=playlist.playlist_url,
+                metadata={
+                    "playlist_id": playlist.playlist_id,
+                    "cleanup_action": cleanup_action,
+                },
+            )
+        )
+    return targets
+
+
+def _saved_playlists(result: ScanResult) -> list[Playlist]:
+    """Return playlists known to be saved rather than owned by this profile."""
+    return [
+        playlist
+        for playlist in result.playlists
+        if _playlist_write_block_reason(playlist, result.account) is not None
+    ]
+
+
 @playlists_app.command("show")
 def playlists_show(ctx: typer.Context, playlist: Annotated[str | None, typer.Option("--playlist")] = None) -> None:
     selected, result = _scan_selected_playlist(_runtime(ctx), playlist)
@@ -516,6 +589,73 @@ def playlists_show(ctx: typer.Context, playlist: Annotated[str | None, typer.Opt
 @playlists_app.command("clean")
 def playlists_clean(
     ctx: typer.Context,
+    playlist: Annotated[str | None, typer.Option("--playlist", help="One playlist ID")] = None,
+    all_items: Annotated[bool, typer.Option("--all", help="All owned and saved playlists")] = False,
+    limit: Annotated[int | None, typer.Option("--limit", help="Clean at most N playlists")] = None,
+    title_contains: Annotated[str | None, typer.Option("--title-contains", help="Filter playlist titles")] = None,
+    channel_name: Annotated[str | None, typer.Option("--channel-name", help="Filter playlist owners")] = None,
+    dry_run: Annotated[bool, typer.Option("--dry-run")] = False,
+    execute: Annotated[bool, typer.Option("--execute")] = False,
+    yes: Annotated[bool, typer.Option("--yes")] = False,
+    confirm: Annotated[
+        bool,
+        typer.Option("--confirm", help="Require typing CLEAN before execution"),
+    ] = False,
+) -> None:
+    """Delete owned playlists and remove saved playlists from the Library."""
+    if dry_run and execute:
+        raise typer.BadParameter("Choose either --dry-run or --execute")
+    runtime = _runtime(ctx)
+    result = _scan(runtime, "playlists")
+    if playlist:
+        selected_playlists = [_choose_playlist(result.playlists, playlist)]
+    elif all_items or limit is not None or title_contains or channel_name:
+        selected_playlists = result.playlists
+    else:
+        selected_playlists = [_choose_playlist(result.playlists, None)]
+    if title_contains:
+        needle = title_contains.casefold()
+        selected_playlists = [item for item in selected_playlists if needle in item.title.casefold()]
+    if channel_name:
+        needle = channel_name.casefold()
+        selected_playlists = [
+            item for item in selected_playlists
+            if item.owner_name and needle in item.owner_name.casefold()
+        ]
+    if limit is not None:
+        if limit < 1:
+            raise typer.BadParameter("limit must be at least 1")
+        selected_playlists = selected_playlists[:limit]
+    if not selected_playlists:
+        raise typer.BadParameter("No playlists matched the selection.")
+    snapshot = export_json(result, runtime.paths.backups, backup=True)
+    targets = _playlist_cleanup_targets(selected_playlists, result.account)
+    plan, path = create_plan(
+        result.account,
+        "clean-playlists",
+        targets,
+        runtime.browser_profile,
+        runtime.paths.plans,
+        source_snapshot=str(snapshot),
+    )
+    owned_count = sum(t.metadata["cleanup_action"] == "delete-owned" for t in plan.targets)
+    saved_count = len(plan.targets) - owned_count
+    console.print(
+        f"Playlists selected: {len(plan.targets):,}\n"
+        f"  Owned playlists to delete: {owned_count:,}\n"
+        f"  Saved playlists to remove from Library: {saved_count:,}"
+    )
+    if owned_count:
+        console.print("[bold red]Owned playlists will be permanently deleted.[/bold red]")
+    if not execute:
+        console.print(f"[bold yellow]DRY RUN[/bold yellow]\nNo YouTube data has been modified.\nPlan: {path}")
+        return
+    _execute_loaded(runtime, plan, yes=yes or not confirm)
+
+
+@playlists_app.command("clear")
+def playlists_clear(
+    ctx: typer.Context,
     playlist: Annotated[str | None, typer.Option("--playlist")] = None,
     all_items: Annotated[bool, typer.Option("--all")] = False,
     limit: Annotated[int | None, typer.Option("--limit")] = None,
@@ -525,10 +665,12 @@ def playlists_clean(
     execute: Annotated[bool, typer.Option("--execute")] = False,
     yes: Annotated[bool, typer.Option("--yes")] = False,
 ) -> None:
+    """Remove video entries from one playlist owned by the active profile."""
     if dry_run and execute:
         raise typer.BadParameter("Choose either --dry-run or --execute")
     runtime = _runtime(ctx)
     selected, result = _scan_selected_playlist(runtime, playlist)
+    _require_writable_playlist(selected, result.account)
     videos = select_videos(result.videos, all_items=all_items, limit=limit,
                            title_contains=title_contains, channel_name=channel_name)
     if not videos:
@@ -537,7 +679,7 @@ def playlists_clean(
     plan, path = create_plan(result.account, "remove-playlist-item", video_targets(videos),
                              runtime.browser_profile, runtime.paths.plans,
                              source_snapshot=str(snapshot))
-    console.print(f"Playlist: {selected.title}\nSelected: {len(plan.targets):,}")
+    console.print(f"Playlist: {selected.title}\nSelected video entries: {len(plan.targets):,}")
     if not execute:
         console.print(f"[bold yellow]DRY RUN[/bold yellow]\nNo YouTube data has been modified.\nPlan: {path}")
         return
@@ -571,6 +713,7 @@ def playlists_deduplicate(
 ) -> None:
     runtime = _runtime(ctx)
     selected, result = _scan_selected_playlist(runtime, playlist)
+    _require_writable_playlist(selected, result.account)
     selected.videos = result.videos
     targets = dedup_targets(selected, keep=keep)
     if not targets:
@@ -640,6 +783,7 @@ def playlists_delete(ctx: typer.Context, playlist: Annotated[str | None, typer.O
                      yes: Annotated[bool, typer.Option("--yes")] = False) -> None:
     runtime = _runtime(ctx)
     selected, result = _scan_selected_playlist(runtime, playlist)
+    _require_writable_playlist(selected, result.account)
     snapshot = export_json(result, runtime.paths.backups, backup=True)
     plan, path = create_plan(result.account, "delete-playlist", _playlist_delete_targets([selected]),
                              runtime.browser_profile, runtime.paths.plans,
@@ -812,5 +956,85 @@ def debug_inspect_menu(
         diagnostic = capture_failure(session.page, runtime.paths.debug, f"menu-inspect-{area}", [])
         console.print(f"Screenshot: {diagnostic}")
         console.print("No menu action was clicked; no YouTube data was modified.")
+    finally:
+        _close(session)
+
+
+@debug_app.command("saved-playlist-controls")
+def debug_saved_playlist_controls(
+    ctx: typer.Context,
+    playlist: Annotated[str | None, typer.Option("--playlist")] = None,
+) -> None:
+    """Inspect comma-separated playlist IDs without clicking any control."""
+    runtime = _runtime(ctx)
+    session, account = _authenticated_session(runtime)
+    try:
+        assert session.page is not None
+        if playlist:
+            playlist_ids = [value.strip() for value in playlist.split(",") if value.strip()]
+        else:
+            scanner = Scanner(session.page, runtime.settings, account=account, debug_dir=runtime.paths.debug)
+            result = scanner.playlists()
+            saved = _saved_playlists(result)
+            if not saved:
+                raise typer.BadParameter("No confidently identified saved playlists found")
+            playlist_ids = [saved[0].playlist_id]
+        observations = []
+        for playlist_id in playlist_ids:
+            navigate(session.page, f"https://www.youtube.com/playlist?list={playlist_id}")
+            controls = session.page.locator("button, [role='button']").evaluate_all(
+                """nodes => nodes.filter(node => {
+                    const style = getComputedStyle(node);
+                    const rect = node.getBoundingClientRect();
+                    return style.visibility !== 'hidden' && style.display !== 'none' && rect.width && rect.height;
+                }).map(node => ({
+                    tag: node.tagName.toLowerCase(),
+                    id: node.id || null,
+                    class_name: node.className || null,
+                    aria_label: node.getAttribute('aria-label'),
+                    aria_pressed: node.getAttribute('aria-pressed'),
+                    title: node.getAttribute('title'),
+                    parent_tag: node.parentElement?.tagName?.toLowerCase() || null,
+                    ancestor_tags: (() => {
+                        const tags = [];
+                        let current = node.parentElement;
+                        for (let i = 0; current && i < 5; i++, current = current.parentElement) {
+                            tags.push(current.tagName.toLowerCase());
+                        }
+                        return tags;
+                    })(),
+                    text: (node.innerText || '').trim()
+                })).filter(item => {
+                    const value = `${item.aria_label || ''} ${item.title || ''} ${item.text || ''}`;
+                    return /more|action|menu|save|library|playlist|edit|share|delete|lainnya|tindakan|simpan|koleksi|ubah|bagikan|hapus/i.test(value);
+                })"""
+            )
+            diagnostic = capture_failure(
+                session.page,
+                runtime.paths.debug,
+                f"playlist-controls-{playlist_id}",
+                [],
+            )
+            body_lines = [
+                line.strip()
+                for line in session.page.locator("body").inner_text().splitlines()
+                if line.strip()
+            ][:80]
+            observations.append(
+                {
+                    "playlist_id": playlist_id,
+                    "url": session.page.url,
+                    "controls": controls,
+                    "body_lines": body_lines,
+                    "diagnostic": str(diagnostic),
+                }
+            )
+        console.print_json(
+            data={
+                "profile": account.channel_handle,
+                "playlists": observations,
+            }
+        )
+        console.print("No control was clicked; no YouTube data was modified.")
     finally:
         _close(session)

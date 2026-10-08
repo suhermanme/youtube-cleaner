@@ -85,7 +85,6 @@ class YouTubePage:
             capture_failure(self.page, self.debug_dir, "selector-failure", attempted)
         raise UIChangedError(message)
 
-
 class LibraryPage(YouTubePage):
     containers = VIDEO_CONTAINER_SELECTORS
 
@@ -330,13 +329,20 @@ class LibraryPage(YouTubePage):
         visible = [candidates.nth(i) for i in range(candidates.count()) if candidates.nth(i).is_visible()]
         if len(visible) != 1:
             self.close_menu()
+            if not visible:
+                self.fail(
+                    "YouTube did not offer a remove-from-playlist action for this item. "
+                    "The playlist is likely saved from another creator or is an auto-generated "
+                    "album, mix, or channel playlist; only playlists owned by the active profile "
+                    "can be cleaned item by item."
+                )
             self.fail(f"Expected one visible remove-from-playlist action; found {len(visible)}")
         visible[0].click()
         try:
             self.page.wait_for_function(
                 """([id, before]) => [...document.querySelectorAll('a[href*="/watch?v="]')]
                     .filter(a => new URL(a.href, location.href).searchParams.get('v') === id).length < before""",
-                [video_id, before],
+                arg=[video_id, before],
                 timeout=8_000,
             )
         except PlaywrightTimeoutError:
@@ -349,7 +355,10 @@ class PlaylistIndexPage(YouTubePage):
         result: dict[str, Playlist] = {}
         rows = self.page.eval_on_selector_all(
             ", ".join(PLAYLIST_CARD_SELECTORS),
-            """(nodes, selectors) => nodes.map(node => {
+            """(nodes, selectors) => nodes.filter(node => {
+                const style = getComputedStyle(node);
+                return node.getClientRects().length && style.display !== 'none' && style.visibility !== 'hidden';
+            }).map(node => {
                 const first = selectors.map(s => node.querySelector(s)).find(Boolean);
                 const owner = node.querySelector(
                     "yt-content-metadata-view-model a[href^='/@'], " +
@@ -361,6 +370,7 @@ class PlaylistIndexPage(YouTubePage):
                         first?.closest('h3')?.getAttribute('title') ||
                         first?.textContent?.trim() || null,
                     owner_name: owner?.textContent?.trim() || null,
+                    owner_href: owner?.getAttribute('href') || null,
                     text: node.innerText || ''
                 };
             })""",
@@ -371,7 +381,9 @@ class PlaylistIndexPage(YouTubePage):
             if not href:
                 continue
             playlist_id = playlist_id_from_url(href)
-            if not playlist_id or playlist_id in {"LL", "WL"} or playlist_id in result:
+            # LL, WL, and SS are YouTube-managed collections (Likes, Watch
+            # Later, and Sounds), not ordinary user-manageable playlists.
+            if not playlist_id or playlist_id in {"LL", "WL", "SS"} or playlist_id in result:
                 continue
             text = row["text"]
             count_match = re.search(r"([\d.,]+)\s+(?:videos?|video)\b", text, re.I)
@@ -387,6 +399,7 @@ class PlaylistIndexPage(YouTubePage):
                 playlist_url=f"{BASE}/playlist?list={playlist_id}",
                 video_count=count,
                 owner_name=row["owner_name"],
+                owner_url=urljoin(BASE, row["owner_href"]) if row["owner_href"] else None,
             )
         return list(result.values())
 
@@ -394,31 +407,117 @@ class PlaylistIndexPage(YouTubePage):
         """Inventory playlist IDs from ordinary rendered links independently."""
         values = self.page.eval_on_selector_all(
             "a[href*='list=']",
-            """nodes => [...new Set(nodes.map(node => {
+            """nodes => [...new Set(nodes.filter(node => {
+                const style = getComputedStyle(node);
+                return node.getClientRects().length && style.display !== 'none' && style.visibility !== 'hidden';
+            }).map(node => {
                 try {
                     return new URL(node.getAttribute('href'), location.href).searchParams.get('list');
                 } catch (_) {
                     return null;
                 }
-            }).filter(id => id && id !== 'LL' && id !== 'WL'))]""",
+            }).filter(id => id && id !== 'LL' && id !== 'WL' && id !== 'SS'))]""",
         )
         return set(values)
 
 
 class PlaylistPage(LibraryPage):
+    _ABSENT_PLAYLIST_LINES = {
+        "the playlist does not exist.",
+        "the playlist does not exist",
+        "this playlist does not exist.",
+        "this playlist does not exist",
+        "playlist tidak ada.",
+        "playlist tidak ada",
+        "playlist ini tidak ada.",
+        "playlist ini tidak ada",
+    }
+
+    def _playlist_is_absent(self) -> bool:
+        lines = {
+            line.strip().casefold()
+            for line in self.page.locator("body").inner_text(timeout=5_000).splitlines()
+            if line.strip()
+        }
+        return bool(lines & self._ABSENT_PLAYLIST_LINES)
+
+    def _library_toggle_state(self) -> str | None:
+        """Return the rendered saved-playlist state, waiting through rerenders."""
+        for _ in range(10):
+            remove = self.page.get_by_role("button", name=label_pattern("remove_playlist_from_library"))
+            visible_remove = [remove.nth(i) for i in range(remove.count()) if remove.nth(i).is_visible()]
+            save = self.page.get_by_role("button", name=label_pattern("save_playlist_to_library"))
+            visible_save = [save.nth(i) for i in range(save.count()) if save.nth(i).is_visible()]
+            if len(visible_remove) == 1 and not visible_save:
+                return "saved"
+            if len(visible_save) == 1 and not visible_remove:
+                return "not-saved"
+            self.page.wait_for_timeout(500)
+        return None
+
+    def _reload_for_persisted_library_state(self) -> str | None:
+        self.page.reload(wait_until="domcontentloaded")
+        self.page.wait_for_timeout(1_000)
+        self.ensure_not_blocked()
+        return self._library_toggle_state()
+
+    def remove_saved_playlist(self, expected_playlist_id: str) -> bool:
+        """Un-save a playlist and verify the state survives a fresh reload."""
+        self.ensure_not_blocked()
+        if playlist_id_from_url(self.page.url) != expected_playlist_id:
+            self.fail("Browser is not on the expected saved playlist; refusing Library removal")
+
+        state = self._library_toggle_state()
+        if state == "not-saved":
+            # Do not trust state left by a prior optimistic rerender. Reload so
+            # retries and resumed jobs are idempotent against persisted state.
+            state = self._reload_for_persisted_library_state()
+            if state == "not-saved":
+                return True
+        if state != "saved":
+            self.fail(
+                "YouTube did not expose one saved-playlist Library toggle. "
+                "The playlist may already be absent or the UI may have changed."
+            )
+
+        remove = self.page.get_by_role("button", name=label_pattern("remove_playlist_from_library"))
+        visible_remove = [remove.nth(i) for i in range(remove.count()) if remove.nth(i).is_visible()]
+        if len(visible_remove) != 1:
+            self.fail(f"Expected one Remove from Library button; found {len(visible_remove)}")
+        visible_remove[0].click()
+        if self._library_toggle_state() != "not-saved":
+            return False
+
+        # The toggle changes optimistically before YouTube has persisted the
+        # mutation. Give it time to settle, then require a fresh page load to
+        # render the not-saved state before checkpointing success.
+        self.page.wait_for_timeout(2_000)
+        return self._reload_for_persisted_library_state() == "not-saved"
+
     def delete_playlist(self, expected_playlist_id: str) -> bool:
         """Delete via header menu and an explicit confirmation dialog only."""
         self.ensure_not_blocked()
         if playlist_id_from_url(self.page.url) != expected_playlist_id:
             self.fail("Browser is not on the expected playlist; refusing deletion")
-        scopes = self.page.locator(
-            "ytd-playlist-header-renderer, ytd-playlist-sidebar-primary-info-renderer, #page-header"
+        # The Playlists feed can retain stale cards after deletion. Treat an
+        # exact YouTube nonexistence message as the desired idempotent state.
+        if self._playlist_is_absent():
+            return True
+        header_scopes = (
+            "ytd-playlist-header-renderer, ytd-playlist-sidebar-primary-info-renderer, "
+            "#page-header, yt-flexible-actions-view-model"
         )
-        buttons: list[Locator] = []
-        for index in range(scopes.count()):
-            scope = scopes.nth(index)
-            matches = scope.get_by_role("button", name=label_pattern("more_actions", exact=False))
-            buttons.extend(matches.nth(i) for i in range(matches.count()) if matches.nth(i).is_visible())
+        matches = self.page.get_by_role(
+            "button", name=label_pattern("more_actions", exact=False)
+        )
+        buttons = [
+            matches.nth(index)
+            for index in range(matches.count())
+            if matches.nth(index).is_visible()
+            and matches.nth(index).evaluate(
+                "(node, scopes) => Boolean(node.closest(scopes))", arg=header_scopes
+            )
+        ]
         if len(buttons) != 1:
             self.fail(f"Expected one playlist-header More actions button; found {len(buttons)}")
         buttons[0].click()
@@ -434,9 +533,12 @@ class PlaylistPage(LibraryPage):
         try:
             self.page.wait_for_function(
                 "id => new URL(location.href).searchParams.get('list') !== id",
-                expected_playlist_id,
+                arg=expected_playlist_id,
                 timeout=10_000,
             )
         except PlaywrightTimeoutError:
-            return playlist_id_from_url(self.page.url) != expected_playlist_id
+            return (
+                playlist_id_from_url(self.page.url) != expected_playlist_id
+                or self._playlist_is_absent()
+            )
         return True

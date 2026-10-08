@@ -75,7 +75,11 @@ def show_account(account: AccountIdentity, profile: str | None = None) -> None:
 def show_scan(result: ScanResult) -> None:
     console.print(f"\n[bold]{result.area.replace('-', ' ').title()}[/bold]")
     if result.area == "playlists":
-        console.print(f"  Playlists discovered: {len(result.playlists):,}")
+        console.print(f"  Playlist cards discovered: {len(result.playlists):,}")
+        console.print(
+            "  [dim]Card count is a feed inventory, not authoritative saved state; "
+            "cleanup verifies each playlist's fresh Library toggle.[/dim]"
+        )
         if (
             result.rendered_playlist_count is not None
             and result.rendered_playlist_count != len(result.playlists)
@@ -118,8 +122,9 @@ def show_playlists(playlists: list[Playlist]) -> None:
     table.add_column("#", justify="right")
     table.add_column("Title")
     table.add_column("Videos", justify="right")
+    table.add_column("Owner")
     table.add_column("Playlist ID")
     for index, playlist in enumerate(playlists, 1):
         count = "?" if playlist.video_count is None else f"{playlist.video_count:,}"
-        table.add_row(str(index), playlist.title, count, playlist.playlist_id)
+        table.add_row(str(index), playlist.title, count, playlist.owner_name or "", playlist.playlist_id)
     console.print(table)

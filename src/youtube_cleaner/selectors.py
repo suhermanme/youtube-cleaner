@@ -15,6 +15,18 @@ LABELS: dict[str, tuple[str, ...]] = {
     "remove_from_liked": ("Remove from Liked videos", "Hapus dari video yang disukai"),
     "remove_from_watch_later": ("Remove from Watch later", "Hapus dari Tonton nanti"),
     "remove_from_playlist": ("Remove from", "Hapus dari"),
+    "remove_playlist_from_library": (
+        "Remove from library",
+        "Remove playlist from library",
+        "Hapus dari koleksi",
+        "Hapus playlist dari koleksi",
+    ),
+    "save_playlist_to_library": (
+        "Save to library",
+        "Save playlist",
+        "Simpan ke koleksi",
+        "Simpan playlist",
+    ),
     "delete_playlist": ("Delete playlist", "Hapus playlist"),
     "confirm_delete": ("Delete", "Hapus"),
     "edit_playlist": ("Edit", "Edit"),

@@ -12,7 +12,7 @@ YouTube Cleaner is a local, safety-first CLI for inspecting and cleaning a YouTu
 - Scans Liked videos, Watch Later, and playlists with bounded lazy loading.
 - Exports JSON/CSV snapshots.
 - Builds account-bound cleanup plans and resumable jobs.
-- Removes Liked/Watch Later/playlist entries through visible menus.
+- Removes Liked/Watch Later entries, deletes owned playlists, and un-saves external playlists through visible controls.
 - Finds duplicates, keeps the first or last occurrence, and can remove the rest.
 - Finds confidently empty playlists and can delete selected playlists.
 
@@ -259,19 +259,38 @@ uv run youtube-cleaner --browser chrome jobs resume JOB_ID
 
 Ctrl+C stops safely after the current operation, checkpoints progress, and prints the resume command. Resume verifies that the active YouTube profile still matches the job.
 
-### Cleaning an owned playlist
+### Cleaning all playlists
+
+`playlists clean` empties the active profile's Playlists library. For playlists
+owned by the active profile, it permanently deletes the playlist. For playlists
+owned by another creator, it removes the saved playlist from the Library without
+altering the creator's playlist or videos. Dry-run all playlists, execute one as
+a canary, then execute all:
+
+```console
+uv run youtube-cleaner --browser chrome playlists clean --all --dry-run
+uv run youtube-cleaner --browser chrome playlists clean --all --limit 1 --execute
+uv run youtube-cleaner --browser chrome playlists clean --all --execute
+```
+
+Playlist cleanup starts without a confirmation phrase by default. Add
+`--confirm` if you want to require typing `CLEAN` before execution.
+
+### Clearing an owned playlist
 
 First list the playlist IDs, inspect the selected playlist, and dry-run the item removal:
 
 ```console
 uv run youtube-cleaner --browser chrome playlists list
 uv run youtube-cleaner --browser chrome playlists show --playlist PLAYLIST_ID
-uv run youtube-cleaner --browser chrome playlists clean --playlist PLAYLIST_ID --all --dry-run
-uv run youtube-cleaner --browser chrome playlists clean --playlist PLAYLIST_ID --limit 1 --execute
-uv run youtube-cleaner --browser chrome playlists clean --playlist PLAYLIST_ID --all --execute
+uv run youtube-cleaner --browser chrome playlists clear --playlist PLAYLIST_ID --all --dry-run
+uv run youtube-cleaner --browser chrome playlists clear --playlist PLAYLIST_ID --limit 1 --execute
+uv run youtube-cleaner --browser chrome playlists clear --playlist PLAYLIST_ID --all --execute
 ```
 
-Only modify playlists owned by the active profile. Saved playlists belonging to other creators appear in the index, but removing/un-saving those playlists from the library is not currently implemented. Entire-playlist deletion is more destructive and requires the separate `playlists delete --playlist PLAYLIST_ID --execute` command plus the `DELETE PLAYLIST` confirmation phrase.
+Only clear playlists owned by the active profile. The separate `playlists
+delete --playlist PLAYLIST_ID --execute` command deletes one selected playlist
+and requires the `DELETE PLAYLIST` confirmation phrase.
 
 ### When authentication expires
 
@@ -311,12 +330,21 @@ Lists are scrolled until several passes find nothing new. A hard scroll cap prev
 
 `scan playlists` inventories the playlist cards in the library index only. It does **not** open every playlist or scan every contained video. Use `playlists show`, `playlists duplicates`, or `playlists empty` when a deeper scan is intended.
 
+The playlist-card count is not an authoritative saved-state count. YouTube can
+retain recently un-saved or recommended external cards in this rendered feed.
+`playlists clean` therefore treats cards as candidates and only checkpoints a
+removal after the playlist detail page is reloaded and freshly renders its
+`Save to Library` state.
+
 The playlist index includes both:
 
 - playlists created by the active YouTube profile; and
 - playlists from other creators that were saved to the library.
 
-Liked Videos (`LL`) and Watch Later (`WL`) are excluded from the playlist-index count because they have their own commands.
+Liked Videos (`LL`), Watch Later (`WL`), and YouTube's special Sounds
+collection (`SS`) are excluded from playlist cleanup because they are not
+ordinary deletable/saved playlists. Likes and Watch Later have their own
+commands.
 
 ### Understanding scan counts
 
@@ -372,13 +400,18 @@ Before every execution the program re-detects the YouTube profile. If the plan b
 
 ## Playlists
 
-Commands accept `--playlist PLAYLIST_ID`; omit it for an interactive choice.
+`playlists clean` deletes owned playlists and removes saved external playlists
+from the Library. With `--all`, it selects every discovered playlist and does
+not prompt for one. `playlists clear` removes video entries from one owned playlist.
+Other commands accept `--playlist PLAYLIST_ID`; omit it for an interactive choice.
 
 ```console
 uv run youtube-cleaner playlists list
 uv run youtube-cleaner playlists show
-uv run youtube-cleaner playlists clean --playlist PLAYLIST_ID --all --dry-run
-uv run youtube-cleaner playlists clean --playlist PLAYLIST_ID --limit 10 --execute
+uv run youtube-cleaner playlists clean --all --dry-run
+uv run youtube-cleaner playlists clean --all --limit 1 --execute
+uv run youtube-cleaner playlists clear --playlist PLAYLIST_ID --all --dry-run
+uv run youtube-cleaner playlists clear --playlist PLAYLIST_ID --limit 10 --execute
 
 uv run youtube-cleaner playlists duplicates --playlist PLAYLIST_ID
 uv run youtube-cleaner playlists deduplicate --playlist PLAYLIST_ID --keep first
@@ -392,9 +425,18 @@ uv run youtube-cleaner playlists delete --playlist PLAYLIST_ID
 uv run youtube-cleaner playlists delete --playlist PLAYLIST_ID --execute
 ```
 
-Whole-playlist deletion requires `--execute` and the phrase `DELETE PLAYLIST`. There is no broad `--all` playlist-delete option. Empty detection performs a detailed scan and only includes playlists whose detail scan completed and contained zero rendered video rows; on a large library this can take a long time.
+The dedicated `playlists delete` command requires `--execute` and the phrase
+`DELETE PLAYLIST`. Broad deletion is performed by `playlists clean --all
+--execute`; it has no prompt by default, or accepts `--confirm` to require
+typing `CLEAN`. Empty detection performs a detailed scan and only includes
+playlists whose detail scan completed and contained zero rendered video rows;
+on a large library this can take a long time.
 
-`playlists delete`, playlist-item cleanup, and deduplication are intended for playlists owned by the active YouTube profile. Saved playlists owned by another creator also appear in the index, but YouTube does not expose their owner-only edit/delete actions. The current application does not implement “Remove saved playlist from library.” If the exact expected action is unavailable, execution stops safely rather than selecting a different menu action.
+`playlists delete`, `playlists clear`, and deduplication are intended for
+playlists owned by the active YouTube profile. `playlists clean` uses Delete for
+owned playlists and YouTube's separate “Remove from Library” toggle for saved
+external playlists. If the exact expected action is unavailable, execution
+stops safely rather than selecting a different menu action.
 
 Deduplication compares ordinary rendered `/watch?v=VIDEO_ID` links. `--keep first` removes matching rows from the last edge; `--keep last` removes from the first edge. This avoids relying on stale absolute row indexes after rerenders.
 
@@ -438,6 +480,7 @@ uv run youtube-cleaner --browser chrome jobs resume JOB_ID
 uv run youtube-cleaner --browser chrome --debug scan likes
 uv run youtube-cleaner --browser chrome debug auth-status
 uv run youtube-cleaner --browser chrome debug inspect --area playlists
+uv run youtube-cleaner --browser chrome debug saved-playlist-controls
 uv run youtube-cleaner --browser chrome debug inspect-menu --area likes
 uv run youtube-cleaner --browser chrome debug inspect-menu --area watch-later
 ```
@@ -487,6 +530,6 @@ For a manual read-only browser check, run `uv run youtube-cleaner scan likes`. F
 - Counts are based solely on content exposed by the rendered UI and ordinary URLs.
 - Unavailable/private entries can expose little metadata.
 - Restoration is not automated.
-- The playlist index includes saved playlists owned by other creators. Removing/un-saving those playlists from the library is not currently implemented.
+- Saved-playlist removal depends on YouTube exposing a semantic “Remove from Library” toggle on the playlist detail page.
 - Owner-only playlist editing and deletion are intended for playlists created by the active YouTube profile; ambiguous ownership or missing actions stop execution.
 - Real-account integration tests are intentionally not automated.
