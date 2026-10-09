@@ -12,13 +12,16 @@ YouTube Cleaner is a local, safety-first CLI for inspecting and cleaning a YouTu
 - Scans Liked videos, Watch Later, and playlists with bounded lazy loading.
 - Exports JSON/CSV snapshots.
 - Builds account-bound cleanup plans and resumable jobs.
-- Removes Liked/Watch Later entries, deletes owned playlists, and un-saves external playlists through visible controls.
+- Removes Liked/Watch Later entries through visible controls. Playlist deletion
+  and un-saving use YouTube's logged-in web-client requests, followed by a fresh
+  rendered-page verification.
 - Finds duplicates, keeps the first or last occurrence, and can remove the rest.
 - Finds confidently empty playlists and can delete selected playlists.
 
 ## What it does NOT use
 
-**This application does not use the YouTube Data API.** It also does not use unofficial HTTP APIs, private endpoints, request interception, or direct backend requests. Therefore it requires:
+**This application does not use the official YouTube Data API.** Therefore it
+requires:
 
 - no Google Cloud project;
 - no API key;
@@ -26,6 +29,15 @@ YouTube Cleaner is a local, safety-first CLI for inspecting and cleaning a YouTu
 - no YouTube API quota.
 
 It never asks for, fills, records, or stores your Google password. It does not read Chrome's cookie database or copy cookies from your everyday browser profile.
+
+For playlist-library mutations, the cleaner sends the same internal `youtubei`
+requests used by YouTube's logged-in website from the dedicated browser context.
+Request metadata and short-lived authorization values are generated in memory
+from that active browser session; they are not logged or persisted. Likes and
+Watch Later still use rendered UI controls. Because the web-client endpoints are
+not a stable public API, playlist cleanup verifies the resulting state in a
+freshly rendered Library page and stops if YouTube rejects or fails to reflect
+the change.
 
 ## Installation
 
@@ -44,6 +56,57 @@ Run either entry point:
 uv run youtube-cleaner
 uv run python -m youtube_cleaner
 ```
+
+### Desktop GUI
+
+Launch the PySide6 desktop control panel from the project directory:
+
+```console
+uv run youtube-cleaner-gui
+```
+
+The GUI exposes the complete day-to-day workflow without requiring commands to
+be typed:
+
+- verify the active profile and run read-only Likes, Watch Later, or playlist scans;
+- preview or execute cleanup with selection filters and an optional item limit;
+- enable continuous discovery for unrestricted all-item cleanup;
+- inspect saved jobs and resume a selected job, optionally with a one-item canary;
+- export JSON or CSV snapshots, list playlist IDs, clear or deduplicate an owned
+  playlist, find/delete empty playlists, and delete one owned playlist;
+- run selector/authentication diagnostics, inspect saved-playlist controls, and
+  manage the dedicated browser profile;
+- follow live command output and safely stop a running cleanup after checkpointing.
+
+Choose `chrome` in the toolbar when using the installed-Chrome profile described
+below. The **Native Chrome login** button opens that dedicated profile; after
+signing in and completely quitting Chrome, click **Continue / Send Enter** in
+the GUI. Cleanup still rechecks the active YouTube profile before changing
+anything. Execute always has a confirmation dialog, and **Require typing
+CLEAN** enables the additional phrase check. For playlist cleanup, owned
+playlists are permanently deleted, saved external playlists are removed from
+the Library, and YouTube's non-removable Saved Shorts and Sounds system
+collections remain untouched.
+
+Recommended GUI workflow:
+
+1. Select `chrome`, then use **Native Chrome login** if the dedicated profile is
+   not already authenticated.
+2. Click **Verify account** and confirm the displayed name and handle in the
+   live output.
+3. Run the appropriate read-only scan or export.
+4. Select a cleanup area and start with **Preview / Dry Run** or set **Limit**
+   to `1` for an execution canary.
+5. For full cleanup, select **All items**. Enable **Keep discovering** only when
+   no limit or filters are set; this is the GUI equivalent of `--discover-more`.
+6. If a run is interrupted, open **Jobs**, select the checkpoint, and resume it.
+   **Discover more** is available there for Likes, Watch Later, and
+   playlist-library jobs.
+
+Only one CLI operation runs at a time. **Stop Safely** sends an interrupt to the
+active command and waits for its checkpointed shutdown. The live-output panel
+shows the exact command and its result, so GUI and terminal runs can be audited
+and resumed interchangeably.
 
 Use installed Chrome with `--browser chrome`. Chromium is the default. Do not point this program at your everyday Chrome profile. The two browser engines use separate dedicated profiles so an accidental Chromium run cannot alter the native-Chrome login:
 

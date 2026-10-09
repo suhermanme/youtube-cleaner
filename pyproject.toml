@@ -12,6 +12,7 @@ license = { text = "MIT" }
 dependencies = [
   "playwright>=1.55,<2",
   "pydantic>=2.11,<3",
+  "pyside6-essentials>=6.8,<7",
   "rich>=14,<15",
   "typer>=0.16,<1",
 ]
@@ -21,6 +22,7 @@ dev = ["pytest>=8.4,<10", "pytest-cov>=6,<8"]
 
 [project.scripts]
 youtube-cleaner = "youtube_cleaner.cli:app"
+youtube-cleaner-gui = "youtube_cleaner.gui:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/youtube_cleaner"]
