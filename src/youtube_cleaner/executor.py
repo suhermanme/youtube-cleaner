@@ -12,7 +12,14 @@ from .account import require_matching_account
 from .config import Settings
 from .jobs import JobStore
 from .models import AccountIdentity, CleanupPlan, JobState, PlanTarget
-from .navigation import LIKED_VIDEOS, WATCH_LATER, navigate
+from .navigation import (
+    LIKED_VIDEOS,
+    WATCH_LATER,
+    is_youtube_generated_playlist,
+    is_youtube_managed_collection,
+    navigate,
+)
+from .network import NetworkMutationError
 from .pages import (
     AutomationBlocked,
     LibraryPage,
@@ -20,10 +27,17 @@ from .pages import (
     UIChangedError,
     playlist_id_from_url,
 )
+from .playlist_cleanup import playlist_cleanup_targets
+from .planner import video_targets
+from .scanner import Scanner
 
 
 class ConfirmationRequired(RuntimeError):
     pass
+
+
+class TargetSkipped(RuntimeError):
+    """A target that is known to have no supported safe cleanup action."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -120,11 +134,28 @@ class Executor:
             raise ConfirmationRequired("Explicit confirmation is required")
         return self.jobs.create(plan)
 
-    def execute_plan(self, plan: CleanupPlan, active: AccountIdentity, *, confirmed: bool) -> tuple[JobState, ExecutionSummary]:
+    def execute_plan(
+        self,
+        plan: CleanupPlan,
+        active: AccountIdentity,
+        *,
+        confirmed: bool,
+        discover_more: bool = False,
+    ) -> tuple[JobState, ExecutionSummary]:
         job = self.job_from_plan(plan, active, confirmed=confirmed)
-        return job, self.resume(job, active)
+        if discover_more:
+            job.continuous_discovery = True
+            self.jobs.save(job)
+        return job, self.resume(job, active, discover_more=discover_more)
 
-    def resume(self, job: JobState, active: AccountIdentity, *, max_targets: int | None = None) -> ExecutionSummary:
+    def resume(
+        self,
+        job: JobState,
+        active: AccountIdentity,
+        *,
+        max_targets: int | None = None,
+        discover_more: bool = False,
+    ) -> ExecutionSummary:
         expected = AccountIdentity(
             authenticated=True,
             channel_name=job.account_name,
@@ -132,6 +163,10 @@ class Executor:
             channel_url=job.account_url,
         )
         require_matching_account(expected, active)
+        if discover_more and not job.continuous_discovery:
+            job.continuous_discovery = True
+            self.jobs.save(job)
+        discover_more = discover_more or job.continuous_discovery
         interrupted = False
         try:
             pending = list(job.remaining)
@@ -159,7 +194,30 @@ class Executor:
                     self.jobs.save(job)
                     self._emit(job, phase="blocked", message=str(exc), target=target)
                     raise
-                except (UIChangedError, Exception) as exc:
+                except TargetSkipped as exc:
+                    job.skipped[target.target_id] = str(exc)
+                    job.failed.pop(target.target_id, None)
+                    job.last_error = None
+                    self.logger.info(
+                        "operation=%s target=%s result=skipped reason=%s",
+                        job.operation,
+                        target.target_id,
+                        exc,
+                    )
+                    job.last_page = self.page.url
+                    self.jobs.save(job)
+                    self._attempted_this_run += 1
+                    self._emit(job, phase="skipped", message=str(exc), target=target)
+                    if self._attempted_this_run < self._targets_this_run:
+                        self._emit(
+                            job,
+                            phase="pacing",
+                            message="Waiting before the next target",
+                            target=target,
+                        )
+                        self._pace()
+                    continue
+                except Exception as exc:
                     # A failed target is checkpointed. Selector ambiguity raises
                     # UIChangedError and stops to avoid repeating unsafe guesses.
                     job.failed[target.target_id] = str(exc)
@@ -169,7 +227,7 @@ class Executor:
                     self.jobs.save(job)
                     self._attempted_this_run += 1
                     self._emit(job, phase="failed", message=str(exc), target=target)
-                    if isinstance(exc, UIChangedError):
+                    if isinstance(exc, (UIChangedError, NetworkMutationError)):
                         break
                     if self._attempted_this_run < self._targets_this_run:
                         self._emit(job, phase="pacing", message="Waiting before the next target", target=target)
@@ -187,6 +245,13 @@ class Executor:
                 if self._attempted_this_run < self._targets_this_run:
                     self._emit(job, phase="pacing", message="Waiting before the next target", target=target)
                     self._pace()
+            if (
+                discover_more
+                and max_targets is None
+                and not job.remaining
+                and self._discover_new_cleanup_targets(job, active)
+            ):
+                return self.resume(job, active, discover_more=True)
         except KeyboardInterrupt:
             interrupted = True
             job.last_error = "Interrupted safely by user"
@@ -201,6 +266,70 @@ class Executor:
             remaining=len(job.remaining),
             interrupted=interrupted,
         )
+
+    def _discover_new_cleanup_targets(
+        self, job: JobState, active: AccountIdentity
+    ) -> bool:
+        """Reload the operation's UI feed until new IDs appear or it converges."""
+        supported = {"remove-liked", "remove-watch-later", "clean-playlists"}
+        if job.operation not in supported:
+            return False
+        known_target_ids = {target.target_id for target in job.targets}
+        known_video_ids = {
+            str(target.metadata.get("video_id", target.target_id.split(":", 1)[0]))
+            for target in job.targets
+        }
+        required_empty_passes = max(1, self.settings.discovery_convergence_passes)
+        for pass_number in range(1, required_empty_passes + 1):
+            self._progress_target = None
+            self._emit(
+                job,
+                phase="discovering",
+                message=(
+                    "Reloading the browser feed for newly surfaced targets "
+                    f"({pass_number}/{required_empty_passes})"
+                ),
+            )
+            scanner = Scanner(
+                self.page,
+                self.settings,
+                account=active,
+                debug_dir=self.debug_dir,
+            )
+            if job.operation == "clean-playlists":
+                result = scanner.playlists()
+                candidates = playlist_cleanup_targets(result.playlists, active)
+                new_targets = [
+                    target for target in candidates
+                    if target.target_id not in known_target_ids
+                ]
+            else:
+                result = scanner.likes() if job.operation == "remove-liked" else scanner.watch_later()
+                candidates = video_targets(result.videos)
+                new_targets = [
+                    target for target in candidates
+                    if str(target.metadata["video_id"]) not in known_video_ids
+                ]
+            if not new_targets:
+                continue
+            job.targets.extend(new_targets)
+            job.last_page = self.page.url
+            job.last_error = None
+            self.jobs.save(job)
+            self._emit(
+                job,
+                phase="discovered",
+                message=f"Added {len(new_targets):,} newly surfaced targets to this job",
+            )
+            return True
+        self._emit(
+            job,
+            phase="converged",
+            message=(
+                f"No new target IDs appeared across {required_empty_passes} fresh feed scans"
+            ),
+        )
+        return False
 
     def _perform(self, job: JobState, target: PlanTarget) -> None:
         video_id = str(target.metadata.get("video_id", target.target_id.split(":", 1)[0]))
@@ -244,11 +373,22 @@ class Executor:
             self._ensure_playlist_open(target.url, "saved playlist")
             playlist = PlaylistPage(self.page, debug_dir=self.debug_dir)
             self._emit_current("removing", "Removing saved playlist from the Library and verifying the UI change")
-            if not self._with_retries(lambda: playlist.remove_saved_playlist(playlist_id)):
+            if not self._with_retries(
+                lambda: playlist.remove_saved_playlist_via_network(playlist_id)
+            ):
                 raise RuntimeError("Saved playlist removal could not be verified")
         elif job.operation == "clean-playlists":
             playlist_id = str(target.metadata["playlist_id"])
             cleanup_action = str(target.metadata["cleanup_action"])
+            if is_youtube_managed_collection(playlist_id):
+                raise TargetSkipped(
+                    "YouTube-managed collection has no supported playlist cleanup action"
+                )
+            # Jobs created before generated playlists were classified correctly
+            # may say delete-owned. Downgrade that stale destructive instruction
+            # to the safe Library-removal path when they are resumed.
+            if cleanup_action == "delete-owned" and is_youtube_generated_playlist(playlist_id):
+                cleanup_action = "remove-saved"
             if cleanup_action == "remove-saved":
                 self._ensure_playlist_open(target.url, "saved playlist")
                 playlist = PlaylistPage(self.page, debug_dir=self.debug_dir)
@@ -256,14 +396,18 @@ class Executor:
                     "removing",
                     "Removing saved playlist from the Library and verifying the UI change",
                 )
-                if not self._with_retries(lambda: playlist.remove_saved_playlist(playlist_id)):
+                if not self._with_retries(
+                    lambda: playlist.remove_saved_playlist_via_network(playlist_id)
+                ):
                     raise RuntimeError("Saved playlist removal could not be verified")
             elif cleanup_action == "delete-owned":
                 self._emit_current("opening", "Opening owned playlist")
                 navigate(self.page, target.url)
                 playlist = PlaylistPage(self.page, debug_dir=self.debug_dir)
                 self._emit_current("removing", "Permanently deleting owned playlist and verifying navigation")
-                if not self._with_retries(lambda: playlist.delete_playlist(playlist_id)):
+                if not self._with_retries(
+                    lambda: playlist.delete_playlist_via_network(playlist_id)
+                ):
                     raise RuntimeError("Playlist deletion could not be verified")
             else:
                 raise ValueError(f"Unsupported playlist cleanup action: {cleanup_action}")
@@ -273,7 +417,9 @@ class Executor:
             navigate(self.page, target.url)
             playlist = PlaylistPage(self.page, debug_dir=self.debug_dir)
             self._emit_current("removing", "Deleting playlist and verifying navigation")
-            if not self._with_retries(lambda: playlist.delete_playlist(playlist_id)):
+            if not self._with_retries(
+                lambda: playlist.delete_playlist_via_network(playlist_id)
+            ):
                 raise RuntimeError("Playlist deletion could not be verified")
         else:
             raise ValueError(f"Unsupported operation: {job.operation}")

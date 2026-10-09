@@ -103,6 +103,7 @@ class JobState(BaseModel):
     completed: list[str] = Field(default_factory=list)
     failed: dict[str, str] = Field(default_factory=dict)
     skipped: dict[str, str] = Field(default_factory=dict)
+    continuous_discovery: bool = False
     browser_profile: str
     last_page: str | None = None
     last_error: str | None = None

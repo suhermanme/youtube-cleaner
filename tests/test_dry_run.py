@@ -1,3 +1,4 @@
+import pytest
 from typer.testing import CliRunner
 
 from youtube_cleaner import cli
@@ -49,11 +50,66 @@ def test_clean_defaults_are_not_execute_flags():
     assert result.exit_code == 0
     assert "--execute" in result.stdout
     assert "--dry-run" in result.stdout
+    assert "--confirm" in result.stdout
+    assert "--discover-more" in result.stdout
+
+    watch_result = CliRunner().invoke(app, ["watch-later", "clean", "--help"])
+    assert watch_result.exit_code == 0
+    assert "--confirm" in watch_result.stdout
+    assert "--discover-more" in watch_result.stdout
 
     playlist_result = CliRunner().invoke(app, ["playlists", "clean", "--help"])
     assert playlist_result.exit_code == 0
     assert "--execute" in playlist_result.stdout
     assert "--dry-run" in playlist_result.stdout
+    assert "--confirm" in playlist_result.stdout
+    assert "--discover-more" in playlist_result.stdout
+
+
+@pytest.mark.parametrize("area", ["likes", "watch-later"])
+def test_area_clean_confirmation_is_opt_in(monkeypatch, tmp_path, area):
+    account = AccountIdentity(
+        authenticated=True,
+        channel_name="Me",
+        channel_handle="@me",
+        channel_url="https://youtube.com/@me",
+    )
+    action = "remove-liked" if area == "likes" else "remove-watch-later"
+    plan = CleanupPlan(
+        plan_id="execute",
+        account=account,
+        action=action,
+        targets=[],
+        browser_profile=str(tmp_path / "profile"),
+    )
+    scan = ScanResult(area=area, account=account)
+    monkeypatch.setattr(
+        cli,
+        "_build_area_plan",
+        lambda *args, **kwargs: (plan, tmp_path / "plan.json", scan),
+    )
+    confirmations = []
+    monkeypatch.setattr(
+        cli,
+        "_execute_loaded",
+        lambda runtime, plan, *, yes, discover_more=False: confirmations.append(
+            (yes, discover_more)
+        ),
+    )
+
+    default = CliRunner().invoke(app, [area, "clean", "--all", "--execute"])
+    confirmed = CliRunner().invoke(
+        app, [area, "clean", "--all", "--execute", "--confirm"]
+    )
+    discovering = CliRunner().invoke(
+        app, [area, "clean", "--all", "--execute", "--discover-more"]
+    )
+
+    assert default.exit_code == 0
+    assert confirmed.exit_code == 0
+    assert discovering.exit_code == 0
+    assert confirmations == [(True, False), (False, False), (True, True)]
+    assert "Continuous discovery enabled" in discovering.stdout
 
 
 def test_dry_run_path_never_calls_executor(monkeypatch, tmp_path):
@@ -158,10 +214,45 @@ def test_playlist_clean_all_selects_owned_and_saved_playlists_without_prompt(mon
     monkeypatch.setattr(
         cli,
         "_execute_loaded",
-        lambda runtime, plan, *, yes: confirmations.append(yes),
+        lambda runtime, plan, *, yes, discover_more=False: confirmations.append(
+            (yes, discover_more)
+        ),
     )
     executed = CliRunner().invoke(app, ["playlists", "clean", "--all", "--execute"])
     confirmed = CliRunner().invoke(app, ["playlists", "clean", "--all", "--execute", "--confirm"])
+    explicit_discovery = CliRunner().invoke(
+        app,
+        ["playlists", "clean", "--all", "--execute", "--discover-more"],
+    )
     assert executed.exit_code == 0
     assert confirmed.exit_code == 0
-    assert confirmations == [True, False]
+    assert explicit_discovery.exit_code == 0
+    assert confirmations == [(True, False), (False, False), (True, True)]
+    assert "Continuous discovery enabled" not in executed.stdout
+    assert "Continuous discovery enabled" in explicit_discovery.stdout
+
+
+def test_playlist_cleanup_excludes_managed_collections_and_treats_mixes_as_saved():
+    account = AccountIdentity(
+        authenticated=True,
+        channel_name="Me",
+        channel_handle="@me",
+        channel_url="https://youtube.com/@me",
+    )
+    playlists = [
+        Playlist(
+            playlist_id="YS",
+            title="Saved Shorts",
+            playlist_url="https://youtube.com/playlist?list=YS",
+        ),
+        Playlist(
+            playlist_id="RDCLAK5uy_mix",
+            title="Presenting Example",
+            playlist_url="https://youtube.com/playlist?list=RDCLAK5uy_mix",
+        ),
+    ]
+
+    targets = cli._playlist_cleanup_targets(playlists, account)
+
+    assert [target.metadata["playlist_id"] for target in targets] == ["RDCLAK5uy_mix"]
+    assert targets[0].metadata["cleanup_action"] == "remove-saved"

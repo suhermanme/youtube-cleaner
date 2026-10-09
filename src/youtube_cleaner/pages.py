@@ -7,6 +7,8 @@ from playwright.sync_api import Locator, Page, TimeoutError as PlaywrightTimeout
 
 from .diagnostics import capture_failure
 from .models import LibraryVideo, Playlist, ScanStatus
+from .navigation import YOUTUBE_MANAGED_COLLECTION_IDS
+from .network import YouTubeNetworkClient
 from .selectors import (
     CHANNEL_LINK_SELECTORS,
     LABELS,
@@ -381,9 +383,13 @@ class PlaylistIndexPage(YouTubePage):
             if not href:
                 continue
             playlist_id = playlist_id_from_url(href)
-            # LL, WL, and SS are YouTube-managed collections (Likes, Watch
-            # Later, and Sounds), not ordinary user-manageable playlists.
-            if not playlist_id or playlist_id in {"LL", "WL", "SS"} or playlist_id in result:
+            # YouTube-managed collections (Likes, Watch Later, Sounds, and
+            # Saved Shorts) are not ordinary user-manageable playlists.
+            if (
+                not playlist_id
+                or playlist_id in YOUTUBE_MANAGED_COLLECTION_IDS
+                or playlist_id in result
+            ):
                 continue
             text = row["text"]
             count_match = re.search(r"([\d.,]+)\s+(?:videos?|video)\b", text, re.I)
@@ -407,7 +413,7 @@ class PlaylistIndexPage(YouTubePage):
         """Inventory playlist IDs from ordinary rendered links independently."""
         values = self.page.eval_on_selector_all(
             "a[href*='list=']",
-            """nodes => [...new Set(nodes.filter(node => {
+            """(nodes, excludedIds) => [...new Set(nodes.filter(node => {
                 const style = getComputedStyle(node);
                 return node.getClientRects().length && style.display !== 'none' && style.visibility !== 'hidden';
             }).map(node => {
@@ -416,7 +422,8 @@ class PlaylistIndexPage(YouTubePage):
                 } catch (_) {
                     return null;
                 }
-            }).filter(id => id && id !== 'LL' && id !== 'WL' && id !== 'SS'))]""",
+            }).filter(id => id && !excludedIds.includes(id)))]""",
+            list(YOUTUBE_MANAGED_COLLECTION_IDS),
         )
         return set(values)
 
@@ -494,6 +501,17 @@ class PlaylistPage(LibraryPage):
         self.page.wait_for_timeout(2_000)
         return self._reload_for_persisted_library_state() == "not-saved"
 
+    def remove_saved_playlist_via_network(self, expected_playlist_id: str) -> bool:
+        """Remove a Library save via the observed YouTube request and verify it."""
+        self.ensure_not_blocked()
+        if playlist_id_from_url(self.page.url) != expected_playlist_id:
+            self.fail("Browser is not on the expected saved playlist; refusing Library removal")
+        if self._reload_for_persisted_library_state() == "not-saved":
+            return True
+        YouTubeNetworkClient(self.page).remove_saved_playlist(expected_playlist_id)
+        self.page.wait_for_timeout(1_000)
+        return self._reload_for_persisted_library_state() == "not-saved"
+
     def delete_playlist(self, expected_playlist_id: str) -> bool:
         """Delete via header menu and an explicit confirmation dialog only."""
         self.ensure_not_blocked()
@@ -542,3 +560,17 @@ class PlaylistPage(LibraryPage):
                 or self._playlist_is_absent()
             )
         return True
+
+    def delete_playlist_via_network(self, expected_playlist_id: str) -> bool:
+        """Delete an owned playlist via the observed request and verify absence."""
+        self.ensure_not_blocked()
+        if playlist_id_from_url(self.page.url) != expected_playlist_id:
+            self.fail("Browser is not on the expected playlist; refusing deletion")
+        if self._playlist_is_absent():
+            return True
+        YouTubeNetworkClient(self.page).delete_owned_playlist(expected_playlist_id)
+        self.page.wait_for_timeout(1_000)
+        self.page.reload(wait_until="domcontentloaded")
+        self.page.wait_for_timeout(1_000)
+        self.ensure_not_blocked()
+        return self._playlist_is_absent()

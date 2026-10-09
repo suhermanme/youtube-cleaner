@@ -4,7 +4,6 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Annotated
-from urllib.parse import urlparse
 
 import typer
 from rich.prompt import IntPrompt, Prompt
@@ -30,8 +29,17 @@ from .executor import AutomationBlocked, ConfirmationRequired, Executor
 from .jobs import JobStore
 from .logging_setup import configure_logging
 from .models import AccountIdentity, PlanTarget, Playlist, ScanResult
-from .navigation import LIKED_VIDEOS, WATCH_LATER, YOUTUBE_HOME, navigate
+from .navigation import (
+    LIKED_VIDEOS,
+    WATCH_LATER,
+    YOUTUBE_HOME,
+    navigate,
+)
 from .pages import LibraryPage
+from .playlist_cleanup import (
+    playlist_cleanup_targets as _playlist_cleanup_targets,
+    playlist_write_block_reason as _playlist_write_block_reason,
+)
 from .planner import (
     create_plan, dedup_targets, find_duplicates, load_plan, select_videos, video_targets,
 )
@@ -400,7 +408,14 @@ def plan_watch(ctx: typer.Context, all_items: Annotated[bool, typer.Option("--al
     _plan_options(ctx, "watch-later", all_items, limit, title_contains, channel_name)
 
 
-def _execute_loaded(runtime: Runtime, plan, *, yes: bool, phrase: str = "CLEAN") -> None:
+def _execute_loaded(
+    runtime: Runtime,
+    plan,
+    *,
+    yes: bool,
+    phrase: str = "CLEAN",
+    discover_more: bool = False,
+) -> None:
     session, active = _authenticated_session(runtime)
     try:
         console.print(f"\nThis YouTube profile's library will be modified:\n  {active.channel_name}\n  {active.channel_handle}")
@@ -418,7 +433,12 @@ def _execute_loaded(runtime: Runtime, plan, *, yes: bool, phrase: str = "CLEAN")
                 debug_dir=runtime.paths.debug if runtime.settings.debug else None,
                 progress=progress.update,
             )
-            job, summary = executor.execute_plan(plan, active, confirmed=True)
+            job, summary = executor.execute_plan(
+                plan,
+                active,
+                confirmed=True,
+                discover_more=discover_more,
+            )
         _show_summary(job.job_id, summary)
     finally:
         _close(session)
@@ -432,7 +452,15 @@ def execute_command(ctx: typer.Context, plan_id: str, yes: Annotated[bool, typer
 
 
 def _clean_area(ctx: typer.Context, area: str, all_items: bool, limit: int | None,
-                title_contains: str | None, channel_name: str | None, execute: bool, yes: bool) -> None:
+                title_contains: str | None, channel_name: str | None, execute: bool,
+                yes: bool, confirm: bool, discover_more: bool) -> None:
+    unrestricted_all = (
+        all_items and limit is None and title_contains is None and channel_name is None
+    )
+    if discover_more and not unrestricted_all:
+        raise typer.BadParameter(
+            "--discover-more requires --all without --limit or filters"
+        )
     runtime = _runtime(ctx)
     plan, path, result = _build_area_plan(runtime, area, all_items=all_items, limit=limit,
                                           title_contains=title_contains, channel_name=channel_name)
@@ -443,12 +471,27 @@ def _clean_area(ctx: typer.Context, area: str, all_items: bool, limit: int | Non
     if not execute:
         console.print(f"\n[bold yellow]DRY RUN[/bold yellow]\nNo YouTube data has been modified.\nPlan saved: {path}")
         return
-    _execute_loaded(runtime, plan, yes=yes)
+    continuous_discovery = discover_more
+    if continuous_discovery:
+        console.print(
+            "[cyan]Continuous discovery enabled:[/cyan] cleanup will rescan the browser feed "
+            "until three fresh passes reveal no new target IDs."
+        )
+    _execute_loaded(
+        runtime,
+        plan,
+        yes=yes or not confirm,
+        discover_more=continuous_discovery,
+    )
 
 
 def _clean_signature(ctx: typer.Context, area: str, all_items: bool, limit: int | None,
-                     title_contains: str | None, channel_name: str | None, execute: bool, yes: bool):
-    _clean_area(ctx, area, all_items, limit, title_contains, channel_name, execute, yes)
+                     title_contains: str | None, channel_name: str | None, execute: bool,
+                     yes: bool, confirm: bool, discover_more: bool):
+    _clean_area(
+        ctx, area, all_items, limit, title_contains, channel_name, execute, yes,
+        confirm, discover_more
+    )
 
 
 @likes_app.command("clean")
@@ -458,10 +501,24 @@ def likes_clean(ctx: typer.Context, all_items: Annotated[bool, typer.Option("--a
                 channel_name: Annotated[str | None, typer.Option("--channel-name")] = None,
                 dry_run: Annotated[bool, typer.Option("--dry-run")] = False,
                 execute: Annotated[bool, typer.Option("--execute")] = False,
-                yes: Annotated[bool, typer.Option("--yes")] = False) -> None:
+                yes: Annotated[bool, typer.Option("--yes")] = False,
+                confirm: Annotated[
+                    bool,
+                    typer.Option("--confirm", help="Require typing CLEAN before execution"),
+                ] = False,
+                discover_more: Annotated[
+                    bool,
+                    typer.Option(
+                        "--discover-more",
+                        help="Continuously rescan UI batches until no new video IDs appear",
+                    ),
+                ] = False) -> None:
     if dry_run and execute:
         raise typer.BadParameter("Choose either --dry-run or --execute")
-    _clean_signature(ctx, "likes", all_items, limit, title_contains, channel_name, execute, yes)
+    _clean_signature(
+        ctx, "likes", all_items, limit, title_contains, channel_name, execute, yes,
+        confirm, discover_more
+    )
 
 
 @watch_app.command("clean")
@@ -471,10 +528,32 @@ def watch_clean(ctx: typer.Context, all_items: Annotated[bool, typer.Option("--a
                 channel_name: Annotated[str | None, typer.Option("--channel-name")] = None,
                 dry_run: Annotated[bool, typer.Option("--dry-run")] = False,
                 execute: Annotated[bool, typer.Option("--execute")] = False,
-                yes: Annotated[bool, typer.Option("--yes")] = False) -> None:
+                yes: Annotated[bool, typer.Option("--yes")] = False,
+                confirm: Annotated[
+                    bool,
+                    typer.Option("--confirm", help="Require typing CLEAN before execution"),
+                ] = False,
+                discover_more: Annotated[
+                    bool,
+                    typer.Option(
+                        "--discover-more",
+                        help="Continuously rescan UI batches until no new video IDs appear",
+                    ),
+                ] = False) -> None:
     if dry_run and execute:
         raise typer.BadParameter("Choose either --dry-run or --execute")
-    _clean_signature(ctx, "watch-later", all_items, limit, title_contains, channel_name, execute, yes)
+    _clean_signature(
+        ctx,
+        "watch-later",
+        all_items,
+        limit,
+        title_contains,
+        channel_name,
+        execute,
+        yes,
+        confirm,
+        discover_more,
+    )
 
 
 @playlists_app.command("list")
@@ -499,31 +578,6 @@ def _choose_playlist(playlists: list[Playlist], playlist_id: str | None) -> Play
     return chosen
 
 
-def _playlist_write_block_reason(playlist: Playlist, account: AccountIdentity) -> str | None:
-    """Explain playlist ownership cases that are definitely not editable.
-
-    The playlist feed contains both playlists created by the active profile and
-    playlists merely saved to its library.  Scanning either kind is valid, but
-    YouTube only exposes per-item removal controls for the former.
-    """
-    if playlist.playlist_id.startswith("OLAK5uy_"):
-        return "it is an auto-generated YouTube Music album playlist"
-
-    owner_path = urlparse(playlist.owner_url or "").path.rstrip("/").casefold()
-    active_paths = {
-        urlparse(account.channel_url or "").path.rstrip("/").casefold(),
-        f"/{(account.channel_handle or '').casefold()}",
-    } - {"", "/"}
-    if owner_path and owner_path not in active_paths:
-        return f"it is owned by {playlist.owner_name or playlist.owner_url!r}, not the active profile"
-
-    owner = " ".join((playlist.owner_name or "").split()).casefold()
-    active_name = " ".join((account.channel_name or "").split()).casefold()
-    if not owner_path and owner and active_name and owner not in {active_name, "you", "anda"}:
-        return f"it is owned by {playlist.owner_name!r}, not the active profile {account.channel_name!r}"
-    return None
-
-
 def _require_writable_playlist(playlist: Playlist, account: AccountIdentity) -> None:
     reason = _playlist_write_block_reason(playlist, account)
     if reason:
@@ -546,28 +600,6 @@ def _scan_selected_playlist(runtime: Runtime, playlist_id: str | None):
         return selected, result
     finally:
         _close(session)
-
-
-def _playlist_cleanup_targets(
-    playlists: list[Playlist], account: AccountIdentity
-) -> list[PlanTarget]:
-    """Build one plan that safely handles both kinds of Library playlist."""
-    targets: list[PlanTarget] = []
-    for playlist in playlists:
-        external = _playlist_write_block_reason(playlist, account) is not None
-        cleanup_action = "remove-saved" if external else "delete-owned"
-        targets.append(
-            PlanTarget(
-                target_id=f"playlist-clean:{playlist.playlist_id}",
-                title=playlist.title,
-                url=playlist.playlist_url,
-                metadata={
-                    "playlist_id": playlist.playlist_id,
-                    "cleanup_action": cleanup_action,
-                },
-            )
-        )
-    return targets
 
 
 def _saved_playlists(result: ScanResult) -> list[Playlist]:
@@ -601,10 +633,28 @@ def playlists_clean(
         bool,
         typer.Option("--confirm", help="Require typing CLEAN before execution"),
     ] = False,
+    discover_more: Annotated[
+        bool,
+        typer.Option(
+            "--discover-more",
+            help="Continuously rescan UI batches until no new playlist IDs appear",
+        ),
+    ] = False,
 ) -> None:
     """Delete owned playlists and remove saved playlists from the Library."""
     if dry_run and execute:
         raise typer.BadParameter("Choose either --dry-run or --execute")
+    unrestricted_all = (
+        all_items
+        and playlist is None
+        and limit is None
+        and title_contains is None
+        and channel_name is None
+    )
+    if discover_more and not unrestricted_all:
+        raise typer.BadParameter(
+            "--discover-more requires --all without --playlist, --limit, or filters"
+        )
     runtime = _runtime(ctx)
     result = _scan(runtime, "playlists")
     if playlist:
@@ -650,7 +700,18 @@ def playlists_clean(
     if not execute:
         console.print(f"[bold yellow]DRY RUN[/bold yellow]\nNo YouTube data has been modified.\nPlan: {path}")
         return
-    _execute_loaded(runtime, plan, yes=yes or not confirm)
+    continuous_discovery = discover_more
+    if continuous_discovery:
+        console.print(
+            "[cyan]Continuous discovery enabled:[/cyan] cleanup will rescan the browser feed "
+            "until three fresh passes reveal no new playlist IDs."
+        )
+    _execute_loaded(
+        runtime,
+        plan,
+        yes=yes or not confirm,
+        discover_more=continuous_discovery,
+    )
 
 
 @playlists_app.command("clear")
@@ -832,10 +893,24 @@ def jobs_resume(
     ctx: typer.Context,
     job_id: str,
     limit: Annotated[int | None, typer.Option("--limit", min=1, help="Process at most N remaining targets")] = None,
+    discover_more: Annotated[
+        bool,
+        typer.Option(
+            "--discover-more",
+            help="After this job empties, rescan UI batches until no new IDs appear",
+        ),
+    ] = False,
 ) -> None:
     runtime = _runtime(ctx)
     store = JobStore(runtime.paths.jobs)
     job = store.load(job_id)
+    discovery_operations = {"remove-liked", "remove-watch-later", "clean-playlists"}
+    if discover_more and job.operation not in discovery_operations:
+        raise typer.BadParameter(
+            "--discover-more is supported for Likes, Watch Later, and playlist-library jobs"
+        )
+    if discover_more and limit is not None:
+        raise typer.BadParameter("Choose either --limit or --discover-more")
     session, active = _authenticated_session(runtime)
     try:
         with JobProgressDisplay() as progress:
@@ -847,7 +922,12 @@ def jobs_resume(
                 debug_dir=runtime.paths.debug if runtime.settings.debug else None,
                 progress=progress.update,
             )
-            summary = executor.resume(job, active, max_targets=limit)
+            summary = executor.resume(
+                job,
+                active,
+                max_targets=limit,
+                discover_more=discover_more,
+            )
         _show_summary(job.job_id, summary)
     finally:
         _close(session)

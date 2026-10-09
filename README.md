@@ -216,7 +216,10 @@ Or, for Likes:
 uv run youtube-cleaner --browser chrome likes clean --limit 1 --execute
 ```
 
-Confirm the active profile and type `CLEAN` when prompted. The application creates a backup and checkpointed job before changing anything.
+Confirm the active profile shown in the terminal. The cleaner starts without a
+phrase prompt by default; add `--confirm` when you want to require typing
+`CLEAN`. The application creates a backup and checkpointed job before changing
+anything.
 
 ### 8. Execute the intended cleanup
 
@@ -227,7 +230,18 @@ uv run youtube-cleaner --browser chrome watch-later clean --all --execute
 uv run youtube-cleaner --browser chrome likes clean --all --execute
 ```
 
-Run only the command for the area you intend to modify. `--yes` bypasses the interactive confirmation and should be used only when you have independently verified the active profile and plan.
+Run only the command for the area you intend to modify. Add `--confirm` to any
+Likes, Watch Later, or playlist-library clean command to require the `CLEAN`
+phrase. The legacy `--yes` flag remains compatible and bypasses that optional
+prompt.
+
+To keep discovering and cleaning targets that YouTube surfaces after the first
+rendered batch, combine unrestricted `--all` with `--discover-more`:
+
+```console
+uv run youtube-cleaner --browser chrome likes clean --all --execute --discover-more
+uv run youtube-cleaner --browser chrome watch-later clean --all --execute --discover-more
+```
 
 During execution, the terminal displays live progress similar to:
 
@@ -270,11 +284,22 @@ a canary, then execute all:
 ```console
 uv run youtube-cleaner --browser chrome playlists clean --all --dry-run
 uv run youtube-cleaner --browser chrome playlists clean --all --limit 1 --execute
-uv run youtube-cleaner --browser chrome playlists clean --all --execute
+uv run youtube-cleaner --browser chrome playlists clean --all --execute --discover-more
 ```
 
 Playlist cleanup starts without a confirmation phrase by default. Add
 `--confirm` if you want to require typing `CLEAN` before execution.
+Adding `--discover-more` to an unrestricted `--all --execute` run enables
+continuous UI discovery: after each rendered batch is cleaned, it reloads the
+corresponding feed, appends newly surfaced IDs to the same checkpointed job,
+and stops after three fresh scans produce no new IDs. Likes, Watch Later, and
+playlist-library cleaners all support this option. To enable the same behavior
+for an older job, resume it with `--discover-more`; the setting is saved in that
+job, so later ordinary resumes retain it:
+
+```console
+uv run youtube-cleaner --browser chrome jobs resume JOB_ID --discover-more
+```
 
 ### Clearing an owned playlist
 
@@ -334,7 +359,10 @@ The playlist-card count is not an authoritative saved-state count. YouTube can
 retain recently un-saved or recommended external cards in this rendered feed.
 `playlists clean` therefore treats cards as candidates and only checkpoints a
 removal after the playlist detail page is reloaded and freshly renders its
-`Save to Library` state.
+`Save to Library` state. With `--discover-more`, full `--all --execute` cleanup
+repeatedly reloads this browser UI feed and extends the job when YouTube
+surfaces previously hidden cards; it does not use the official YouTube Data
+API.
 
 The playlist index includes both:
 
@@ -342,7 +370,7 @@ The playlist index includes both:
 - playlists from other creators that were saved to the library.
 
 Liked Videos (`LL`), Watch Later (`WL`), and YouTube's special Sounds
-collection (`SS`) are excluded from playlist cleanup because they are not
+collection (`SS`) and Saved Shorts (`YS`) are excluded from playlist cleanup because they are not
 ordinary deletable/saved playlists. Likes and Watch Later have their own
 commands.
 
@@ -394,7 +422,10 @@ uv run youtube-cleaner watch-later clean --title-contains "kids" --dry-run
 uv run youtube-cleaner watch-later clean --all --execute
 ```
 
-Supported selectors are `--all`, `--limit N`, `--title-contains TEXT`, and `--channel-name TEXT`. At least one must be supplied. `--yes` skips the interactive phrase only when explicitly provided. Without it, type `CLEAN`.
+Supported selectors are `--all`, `--limit N`, `--title-contains TEXT`, and
+`--channel-name TEXT`. At least one must be supplied. Execution has no phrase
+prompt by default. Add `--confirm` to require typing `CLEAN`. Continuous
+discovery requires unrestricted `--all` plus `--discover-more`.
 
 Before every execution the program re-detects the YouTube profile. If the plan belongs to `@example` and the browser is on `@different`, it refuses before any destructive click.
 
@@ -410,6 +441,7 @@ uv run youtube-cleaner playlists list
 uv run youtube-cleaner playlists show
 uv run youtube-cleaner playlists clean --all --dry-run
 uv run youtube-cleaner playlists clean --all --limit 1 --execute
+uv run youtube-cleaner playlists clean --all --execute --discover-more
 uv run youtube-cleaner playlists clear --playlist PLAYLIST_ID --all --dry-run
 uv run youtube-cleaner playlists clear --playlist PLAYLIST_ID --limit 10 --execute
 

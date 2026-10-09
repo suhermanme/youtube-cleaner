@@ -85,3 +85,4 @@ class Settings:
     max_no_change_attempts: int = 5
     max_scrolls: int = 500
     retries: int = 2
+    discovery_convergence_passes: int = 3
